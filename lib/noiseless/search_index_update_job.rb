@@ -14,7 +14,10 @@ module Noiseless
     end
 
     def self.perform_now(model_class_name, record_id, operation, options = {})
-      model_class = model_class_name.constantize
+      # safe_constantize: `constantize` on an arbitrary queued argument can load
+      # any constant, and a bad name raised NameError that was then swallowed.
+      model_class = model_class_name.safe_constantize
+      raise Noiseless::Error, "Unknown model for indexing: #{model_class_name}" unless model_class
 
       case operation
       when "update"
@@ -31,12 +34,23 @@ module Noiseless
         raise ArgumentError, "Unknown operation: #{operation}"
       end
     rescue StandardError => e
-      if options[:raise_on_error]
-        raise e
-      elsif (logger = Rails.logger)
-        # Log error silently
-        logger.error "Noiseless: Background job failed for #{model_class_name}##{record_id}: #{e.message}"
-      end
+      # Re-raise when dispatched to a background queue so ActiveJob/Sidekiq
+      # retry and dead-letter the job. perform_now previously swallowed the
+      # error, so the job reported success on failure: no retry, no alert, and a
+      # permanently broken index. Callers wanting the lenient behaviour can pass
+      # raise_on_error: false.
+      raise e if queue_backend? || options[:raise_on_error]
+
+      Noiseless.logger&.error(
+        "Noiseless: index #{operation} failed for #{model_class_name}##{record_id}: #{e.message}"
+      )
+      nil
+    end
+
+    # True when a background job backend is present, in which case failures must
+    # propagate for retry/dead-letter semantics.
+    def self.queue_backend?
+      defined?(ActiveJob::Base) || defined?(Sidekiq)
     end
 
     # Minimal object for deleted records

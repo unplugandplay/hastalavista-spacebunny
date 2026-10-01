@@ -9,7 +9,15 @@ module Noiseless
       end
 
       def get(index:)
-        @adapter.execute_index_exists?(index) ? { index => {} } : raise("Index not found")
+        # index_exists? returns an Async::Task, which is always truthy — calling
+        # the private execute_index_exists? raised NoMethodError, and awaiting
+        # the task without inspecting it would always report "exists". Resolve
+        # the task to a real boolean.
+        exists = @adapter.index_exists?(index)
+        exists = exists.wait if exists.is_a?(Async::Task)
+        raise Noiseless::Error, "Index not found: #{index}" unless exists
+
+        { index => {} }
       end
 
       def stats(index:)

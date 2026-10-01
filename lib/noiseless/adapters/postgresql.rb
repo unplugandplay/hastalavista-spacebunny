@@ -132,7 +132,7 @@ module Noiseless
         missing = required_extensions - available_extensions
         return if missing.empty?
 
-        Rails.logger.warn(
+        Noiseless.logger&.warn(
           "Noiseless PostgreSQL adapter: Missing extensions: #{missing.join(', ')}. " \
           "Some search features may be limited."
         )
@@ -153,7 +153,7 @@ module Noiseless
         SQL
         result.pluck("extname")
       rescue StandardError => e
-        Rails.logger.error("Failed to detect PostgreSQL extensions: #{e.message}")
+        Noiseless.logger&.error("Failed to detect PostgreSQL extensions: #{e.message}")
         []
       end
 

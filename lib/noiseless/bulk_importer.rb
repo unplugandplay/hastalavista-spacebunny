@@ -19,11 +19,10 @@ module Noiseless
                **)
       @errors.clear
 
-      # Create index if force is true
-      if force
-        delete_index
-        create_index
-      end
+      # Recreate the index from scratch when force is true. The index must exist
+      # before any document is written, otherwise the bulk calls below write
+      # into a missing index.
+      recreate_index! if force
 
       # Get records to import
       records = resolve_records(relation_or_records)
@@ -168,28 +167,60 @@ module Noiseless
 
     def delete_index
       client = Noiseless.connections.client(@connection)
-      client.delete_index(index_name)
-    rescue StandardError => _e
-      # Index might not exist, which is fine
-      nil
+      client.delete_index(index_name).wait
+      true
+    rescue Noiseless::RequestError => e
+      # A 404 means there was nothing to delete, which is the desired state.
+      # Any other backend failure (auth, connectivity, timeout) is real and
+      # must not be mistaken for "already absent".
+      raise unless e.status == 404
+
+      true
     end
 
+    # Delete then recreate, aborting if the index cannot be restored. The
+    # previous implementation called a create_index whose body was commented
+    # out, so a forced reindex destroyed the index and then bulk-indexed into
+    # a non-existent index — silent data loss.
+    def recreate_index!
+      delete_index
+      return if create_index
+
+      raise Noiseless::Error,
+            "index #{index_name.inspect} was deleted but could not be recreated; " \
+            "aborting import to avoid writing into a missing index"
+    end
+
+    # Create the index with the model's mapping. Returns true when the index
+    # exists afterwards (created now, or already present).
     def create_index
-      return unless model_class.respond_to?(:mapping)
+      client = Noiseless.connections.client(@connection)
+
+      return true if client.index_exists?(index_name).wait
+
+      mappings = resolved_mapping
+      if mappings.nil?
+        # No mapping declared: create the index with default settings.
+        client.create_index(index_name).wait
+      else
+        client.create_index(index_name, mappings: mappings).wait
+      end
+
+      true
+    rescue StandardError => e
+      @errors << { error: "Failed to create index: #{e.message}", index: index_name }
+      false
+    end
+
+    # Convert the model's `mapping do ... end` block into the hash the adapters
+    # expect, or nil when the model declares no mapping.
+    def resolved_mapping
+      return nil unless model_class.respond_to?(:mapping)
 
       mapping_block = model_class.mapping
-      return unless mapping_block
+      return nil unless mapping_block
 
-      begin
-        _client = Noiseless.connections.client(@connection)
-        # This would need to be implemented in the adapter
-        # client.create_index(index_name, mapping: mapping_block)
-      rescue StandardError => e
-        @errors << {
-          error: "Failed to create index: #{e.message}",
-          index: index_name
-        }
-      end
+      MappingDefinitionProcessor.process(mapping_block)
     end
   end
 end

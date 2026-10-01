@@ -59,8 +59,11 @@ module Noiseless
       self
     end
 
-    def paginate(page: nil, per_page: nil)
-      @builder.paginate(page: page, per_page: per_page)
+    def paginate(**)
+      # Forward only what the caller supplied. Passing explicit nils here
+      # overrode QueryBuilder#paginate's own defaults, producing
+      # AST::Paginate.new(nil, nil) and a NoMethodError in the adapter.
+      @builder.paginate(**)
       self
     end
 

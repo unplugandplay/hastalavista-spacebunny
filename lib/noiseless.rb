@@ -40,18 +40,37 @@ module Noiseless
   # exception classes from whatever HTTP stack the transport happens to use.
   class ConnectionError < Error; end
 
+  # Rails.logger is referenced throughout the gem, but Rails may be absent
+  # (plain ActiveRecord, rake tasks, standalone adapter use). Referencing
+  # `Rails` unguarded inside a rescue handler raises NameError and masks the
+  # original error, so every log call goes through this guard instead.
+  def self.logger
+    return nil unless defined?(Rails) && Rails.respond_to?(:logger)
+
+    Rails.logger
+  end
+
   class Configuration
     attr_accessor :connections_config, :default_connection, :default_adapter, :config_path
     # Global kill switch for model auto-indexing callbacks. Lets environments
     # without a search backend (e.g. CI) run without connection-error noise on
     # every save. Defaults to NOISELESS_AUTO_INDEX env var, on unless "false".
     attr_accessor :auto_index
+    # Whether a failed search raises instead of degrading to an empty result
+    # set. Elasticsearch/OpenSearch have always raised; the PostgreSQL and
+    # Typesense adapters previously swallowed failures into "0 hits", which
+    # made an outage indistinguishable from an empty index.
+    #
+    # Defaults to true. Set NOISELESS_RAISE_ON_SEARCH_ERROR=false to restore the
+    # legacy behaviour where a backend error yields an empty response.
+    attr_accessor :raise_on_search_error
 
     def initialize
       @connections_config = {}
       @default_connection = :primary
       @default_adapter = :opensearch
       @auto_index = ENV.fetch("NOISELESS_AUTO_INDEX", "true") != "false"
+      @raise_on_search_error = ENV.fetch("NOISELESS_RAISE_ON_SEARCH_ERROR", "true") != "false"
       @config_path = lambda do
         if defined?(Rails) && Rails.respond_to?(:root) && Rails.root
           Rails.root.join("config/noiseless.yml")

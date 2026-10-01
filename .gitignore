@@ -8,6 +8,7 @@ docker-compose.override.yml
 test/dummy/tmp/local_secret.txt
 
 # Test artifacts
+coverage/
 test/coverage/
 test/dummy/log/*
 test/dummy/tmp/*

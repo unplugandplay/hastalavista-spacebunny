@@ -203,8 +203,15 @@ module Noiseless
               end
             }
           }
+        rescue Noiseless::Error
+          raise
         rescue StandardError => e
-          # Return empty response on error to maintain compatibility
+          # A backend failure must not masquerade as an empty result set:
+          # callers cannot otherwise tell "no documents matched" from
+          # "Typesense is down / rejected the query".
+          raise Noiseless::SearchError, "typesense search failed: #{e.message}" if Noiseless.config.raise_on_search_error
+
+          Noiseless.logger&.error("Noiseless: typesense search failed: #{e.message}")
           {
             took: 0,
             timed_out: false,
@@ -302,9 +309,10 @@ module Noiseless
         def execute_index_exists?(collection_name)
           response = head_request("/collections/#{collection_name}")
           response.success?
-        rescue StandardError
-          false
         ensure
+          # No blanket rescue: a transport failure must propagate rather than be
+          # reported as "collection missing". Callers gate destructive work
+          # (delete-then-recreate) on this answer.
           response&.close
         end
 
@@ -354,9 +362,9 @@ module Noiseless
         def execute_document_exists?(collection, id)
           response = head_request("/collections/#{collection}/documents/#{id}")
           response.success?
-        rescue StandardError
-          false
         ensure
+          # Propagates transport failures, so "not found" and "backend down"
+          # stay distinguishable.
           response&.close
         end
 

@@ -26,9 +26,11 @@ module Noiseless
         #
         def vector_search(scope, embedding, column: :embedding, limit: 20, distance_threshold: nil,
                           distance_metric: :cosine)
-          return scope unless pgvector_available?
+          # Fail closed: without pgvector a semantic query must return nothing
+          # rather than silently degrading to the unfiltered scope.
+          return scope.none unless pgvector_available?
 
-          vector_string = "[#{embedding.join(',')}]"
+          vector_string = vector_literal(embedding)
           distance_op = distance_operator(distance_metric)
 
           # Build the query with distance calculation
@@ -50,6 +52,25 @@ module Noiseless
                .limit(limit)
         end
 
+        # Build a pgvector literal from an embedding.
+        #
+        # The literal is interpolated into SQL (pgvector's `<=>` operator has no
+        # bind-parameter form in a SELECT list / ORDER BY), so every element is
+        # coerced to a finite Float first. A string element can no longer break
+        # out of the single-quoted literal, which previously allowed arbitrary
+        # SQL to be injected via the query embedding.
+        def vector_literal(embedding)
+          values = Array(embedding).map do |value|
+            f = Float(value)
+            raise ArgumentError, "embedding contains a non-finite value" unless f.finite?
+
+            f
+          end
+          raise ArgumentError, "embedding must not be empty" if values.empty?
+
+          "[#{values.join(',')}]"
+        end
+
         # Hybrid search combining text and vector search
         #
         # @param scope [ActiveRecord::Relation] Base scope
@@ -63,11 +84,17 @@ module Noiseless
         #
         def hybrid_search(scope, text_query:, embedding:, text_fields:, vector_column: :embedding,
                           text_weight: 0.5, vector_weight: 0.5, limit: 20)
-          return scope unless pgvector_available?
+          # Fail closed for the same reason as vector_search.
+          return scope.none unless pgvector_available?
 
-          vector_string = "[#{embedding.join(',')}]"
+          vector_string = vector_literal(embedding)
           text_conditions = text_fields.map { |f| "similarity(#{quoted_column(f)}, ?)" }.join(" + ")
           text_similarity_count = text_fields.size
+          return scope.none if text_similarity_count.zero?
+
+          # Coerce weights to Float so they cannot be interpolated as SQL.
+          text_weight = Float(text_weight)
+          vector_weight = Float(vector_weight)
 
           # Normalized combined score
           scope.select(
@@ -86,7 +113,6 @@ module Noiseless
             *Array.new(text_similarity_count, text_query)
           ).order(Arel.sql("combined_score DESC"))
                .limit(limit)
-               .tap { |s| s.bind_values.concat(Array.new(text_similarity_count, text_query)) }
         end
 
         # Execute a KNN (K-Nearest Neighbors) search
@@ -101,15 +127,16 @@ module Noiseless
         def knn_search(model, embedding, k: 10, column: :embedding, filters: {})
           return [] unless pgvector_available?
 
-          vector_string = "[#{embedding.join(',')}]"
+          vector_string = vector_literal(embedding)
 
           scope = model.all
           scope = scope.where(filters) if filters.any?
 
+          column_ref = quote_with(model, column)
           results = scope.select(
-            "#{model.table_name}.*",
-            "#{quoted_column(column)} <=> '#{vector_string}' AS distance"
-          ).order(Arel.sql("#{quoted_column(column)} <=> '#{vector_string}'"))
+            "#{scope.table_name}.*",
+            "#{column_ref} <=> '#{vector_string}' AS distance"
+          ).order(Arel.sql("#{column_ref} <=> '#{vector_string}'"))
                          .limit(k)
 
           format_knn_response(results, model)
@@ -124,7 +151,7 @@ module Noiseless
         def store_embedding(record, embedding, column: :embedding)
           return false unless pgvector_available?
 
-          vector_string = "[#{embedding.join(',')}]"
+          vector_string = vector_literal(embedding)
           record.update_column(column, vector_string)
         end
 
@@ -137,22 +164,35 @@ module Noiseless
         def batch_store_embeddings(model, embeddings, column: :embedding)
           return 0 unless pgvector_available?
 
-          # Use UPDATE FROM VALUES for efficient batch update
+          connection = model.connection
+          table = connection.quote_table_name(model.table_name)
+          column_ref = connection.quote_column_name(column)
+
+          primary_key = model.primary_key
+          raise ArgumentError, "#{model} has no primary key to batch-update by" if primary_key.nil?
+
+          pk_ref = connection.quote_column_name(primary_key)
+          # Cast to the primary key's actual SQL type rather than assuming uuid,
+          # which raised on every non-UUID primary key.
+          pk_type = model.columns_hash[primary_key.to_s]&.sql_type || "text"
+
+          # Every identifier is quoted and every value is escaped/coerced, so
+          # neither ids, embeddings nor the column name can inject SQL.
           values = embeddings.map do |id, emb|
-            "(#{ActiveRecord::Base.connection.quote(id)}, '[#{emb.join(',')}]'::vector)"
+            "(#{connection.quote(id)}::#{pk_type}, '#{vector_literal(emb)}'::vector)"
           end.join(",")
 
           sql = <<~SQL.squish
-            UPDATE #{model.table_name}
-            SET #{column} = v.embedding
+            UPDATE #{table}
+            SET #{column_ref} = v.embedding
             FROM (VALUES #{values}) AS v(id, embedding)
-            WHERE #{model.table_name}.id = v.id::uuid
+            WHERE #{table}.#{pk_ref} = v.id
           SQL
 
-          ActiveRecord::Base.connection.execute(sql)
+          connection.execute(sql)
           embeddings.size
         rescue StandardError => e
-          Rails.logger.error("Failed to batch store embeddings: #{e.message}")
+          Noiseless.logger&.error("Failed to batch store embeddings: #{e.message}")
           0
         end
 

@@ -18,7 +18,10 @@ module Noiseless
 
         def execute_search(query_hash, model_class: nil, **)
           model = resolve_model(query_hash[:indexes], model_class)
-          return empty_response unless model
+          if model.nil?
+            raise Noiseless::SearchError,
+                  "no searchable model for index #{query_hash[:indexes].inspect}"
+          end
 
           # Check if this is a vector search
           return execute_vector_search(model, query_hash) if query_hash[:vector]
@@ -28,13 +31,18 @@ module Noiseless
           records = apply_pagination(scope, query_hash[:paginate]).to_a
 
           format_as_search_response(records, model, total: total)
+        rescue Noiseless::Error
+          raise
         rescue StandardError => e
-          error_response(e)
+          raise_search_failure(e)
         end
 
         def execute_vector_search(model, query_hash)
           vector_node = query_hash[:vector]
-          return empty_response unless vector_node && pgvector_available?
+          unless vector_node && pgvector_available?
+            raise Noiseless::SearchError,
+                  "vector search requires the pgvector extension to be installed"
+          end
 
           # Start with base scope
           scope = model.all
@@ -51,10 +59,28 @@ module Noiseless
             distance_metric: vector_node.distance_metric
           )
 
+          # Honour pagination: without this, page 3 returned page 1's rows while
+          # the pagination metadata still advertised page 3.
+          scope = apply_pagination(scope, query_hash[:paginate])
+
           records = scope.to_a
           format_vector_response(records, model, vector_node)
+        rescue Noiseless::Error
+          raise
         rescue StandardError => e
-          error_response(e)
+          raise_search_failure(e)
+        end
+
+        # Turn a backend failure into a raised SearchError instead of an empty
+        # result set. An unreachable database, a bad query, or a permissions
+        # error must never be indistinguishable from "no matching documents".
+        # Honours Noiseless.config.raise_on_search_error for callers that
+        # explicitly want the legacy empty-response behaviour.
+        def raise_search_failure(error)
+          raise Noiseless::SearchError, "postgresql search failed: #{error.message}" if Noiseless.config.raise_on_search_error
+
+          Noiseless.logger&.error("Noiseless: postgresql search failed: #{error.message}")
+          error_response(error)
         end
 
         def format_vector_response(records, model, _vector_node)
@@ -100,9 +126,9 @@ module Noiseless
 
         def execute_index_exists?(index_name)
           model = resolve_model([index_name])
-          model.present? && model.table_exists?
-        rescue StandardError
-          false
+          return false if model.nil?
+
+          model.table_exists?
         end
 
         # Document writes are no-ops: the table IS the index, so queries always
@@ -123,9 +149,9 @@ module Noiseless
 
         def execute_document_exists?(index, id)
           model = resolve_model([index])
-          model&.exists?(id: id) || false
-        rescue StandardError
-          false
+          return false if model.nil?
+
+          model.exists?(id: id)
         end
 
         def execute_cluster_health(**)
@@ -268,7 +294,12 @@ module Noiseless
             value = node.value
 
             scope = if value.is_a?(Hash) && value[:geo_distance]
-                      apply_geo_filter(scope, node)
+                      apply_geo_filter(scope, node, model)
+                    elsif range_filter?(value)
+                      # Cross-adapter parity: ES/OpenSearch accept
+                      # `filter(:age, { gte: 18 })`. ActiveRecord cannot build
+                      # that from a raw hash, so translate it into a Range node.
+                      apply_range(scope, AST::Range.new(node.field, **range_bounds(value)), model)
                     elsif model && !column?(model, node.field.to_s)
                       # A filter on a mapping-only field cannot be enforced;
                       # silently dropping it would broaden results, so fail closed.
@@ -290,26 +321,46 @@ module Noiseless
           scope.where("#{quoted_column(field)} #{operator} ARRAY[?]::#{cast}", value)
         end
 
-        def apply_geo_filter(scope, node)
+        def apply_geo_filter(scope, node, model)
           # Requires PostGIS
           geo_config = node.value[:geo_distance]
-          distance = geo_config[:distance]
           field = node.field.to_s
 
-          # Find the geo point in config
-          geo_point = geo_config.find { |_k, v| v.is_a?(Hash) && v[:lat] && v[:lon] }&.last
-          return scope unless geo_point
+          # A geo filter on a mapping-only field cannot be enforced. Silently
+          # dropping it would broaden results to the whole table, so fail closed
+          # like the other clause builders.
+          return scope.none unless column?(model, field)
 
-          # Use PostGIS ST_DWithin for efficient geo filtering
+          distance = geo_config[:distance]
+
+          # Find the geo point in config. Accept symbol or string keys so a
+          # JSON-derived query hash is not mistaken for a missing point.
+          geo_point = geo_config.values.find do |v|
+            v.is_a?(Hash) && (v[:lat] || v["lat"]) && (v[:lon] || v["lon"])
+          end
+          # A malformed point must not widen the result set: returning the
+          # unfiltered scope here would answer "near Paris" with the whole
+          # table. Fail closed instead.
+          return scope.none if geo_point.nil?
+
+          lat = geo_point[:lat] || geo_point["lat"]
+          lon = geo_point[:lon] || geo_point["lon"]
+
+          # Use PostGIS ST_DWithin for efficient geo filtering. The column is
+          # quoted through the connection (never interpolated raw) and every
+          # value is a bind parameter.
           scope.where(
-            "ST_DWithin(#{field}::geography, ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography, ?)",
-            geo_point[:lon],
-            geo_point[:lat],
+            "ST_DWithin(#{quoted_column(field)}::geography, " \
+            "ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography, ?)",
+            Float(lon),
+            Float(lat),
             parse_distance(distance)
           )
-        rescue StandardError
-          # If PostGIS not available, skip geo filter
-          scope
+        rescue ArgumentError, TypeError => e
+          # Unparseable coordinates/distance: fail closed rather than silently
+          # widening the result set.
+          Noiseless.logger&.warn("Noiseless: ignoring geo filter, invalid coordinates: #{e.message}")
+          scope.none
         end
 
         def apply_sorting(scope, sort_nodes, model = nil)
@@ -406,11 +457,13 @@ module Noiseless
           # Try cached model first (populated via register_model)
           return @model_class_cache[index_name] if @model_class_cache&.key?(index_name)
 
-          # Try to infer model from index name
-          model_name = index_name.to_s.classify
-          model_name.constantize
-        rescue NameError
-          nil
+          # Try to infer model from index name. The constantized value must be an
+          # ActiveRecord model: an index named "string" would otherwise resolve
+          # to String and blow up later with a confusing NoMethodError.
+          candidate = index_name.to_s.classify.safe_constantize
+          return nil unless active_record_model?(candidate)
+
+          candidate
         end
 
         def active_record_model?(klass)
@@ -429,13 +482,34 @@ module Noiseless
           model.columns_hash.key?(field.to_s)
         end
 
+        # True when a filter value is a range specification ({ gte: 18 }) rather
+        # than an exact value. Mirrors the ES/OpenSearch check in
+        # Adapter#build_filter_hash so both backends accept the same query shape.
+        def range_filter?(value)
+          return false unless value.is_a?(Hash) && !value.empty?
+
+          (value.keys.map(&:to_sym) - Noiseless::Adapter::RANGE_OPERATORS).empty?
+        end
+
+        def range_bounds(value)
+          value.each_with_object({}) do |(key, val), bounds|
+            bounds[key.to_sym] = val
+          end
+        end
+
         def text_column?(model, field)
           column = model.columns_hash[field.to_s]
           column && %i[string text citext].include?(column.type) && !column.array
         end
 
         def array_column?(model, field)
-          model.columns_hash[field.to_s]&.array
+          # Column#array is defined only on the PostgreSQL adapter's Column
+          # subclass. Calling it on any other adapter raises NoMethodError,
+          # which would be swallowed into "0 results", so probe defensively.
+          column = model.columns_hash[field.to_s]
+          return false unless column.respond_to?(:array)
+
+          column.array
         end
 
         def fuzzy_column(field)
@@ -447,7 +521,16 @@ module Noiseless
         end
 
         def quoted_column(field)
-          ActiveRecord::Base.connection.quote_column_name(field)
+          quote_with(nil, field)
+        end
+
+        # Quote an identifier using the search model's own connection. A model
+        # bound to a non-default database must be quoted by *that* adapter's
+        # rules; using ActiveRecord::Base.connection mismatches quoting for
+        # multi-DB setups.
+        def quote_with(model, field)
+          connection = model.respond_to?(:connection) ? model.connection : ActiveRecord::Base.connection
+          connection.quote_column_name(field)
         end
 
         def sanitize_like(value)

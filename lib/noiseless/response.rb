@@ -6,9 +6,40 @@ module Noiseless
       include Enumerable
       include Pagination::ResponsePagination
 
+      # Extract a human-readable reason from the various error shapes backends
+      # use ({ type:, reason: }, { error: "..." }, or a bare string).
+      def error_reason(err = error)
+        case err
+        when Hash
+          err["reason"] || err["message"] || err["type"] || err.to_s
+        when String
+          err
+        else
+          err.to_s
+        end
+      end
+
+      # True when the backend reported a failure inside an otherwise
+      # well-formed search-response envelope.
+      def error
+        @raw_response["error"]
+      end
+
+      def error?
+        !error.nil?
+      end
+
       def initialize(raw_response, model_class = nil)
         @raw_response = raw_response
         @model_class = model_class
+
+        # Adapters embed backend failures in the response body while still
+        # returning a valid hits envelope. Without this check a failed query
+        # is indistinguishable from an empty result set: total == 0,
+        # empty? == true, and no exception anywhere.
+        return unless error? && Noiseless.config.raise_on_search_error
+
+        raise Noiseless::SearchError, "search failed: #{error_reason(error)}"
       end
 
       def total
