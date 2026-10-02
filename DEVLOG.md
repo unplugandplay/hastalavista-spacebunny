@@ -4,6 +4,37 @@ Append-only record of engineering work on `noiseless`. Newest first.
 
 ---
 
+## 2026-10-01 — Issues filed upstream
+
+The findings were validated by the original author, so they were filed as issues on
+[`seuros/noiseless`](https://github.com/seuros/noiseless) with severity ratings and
+proposed code changes. Upstream `master` at the time of filing was `0b28fb0` — the same
+commit this audit started from — so every line reference was re-verified against it.
+
+| Issue | Severity | Scope |
+|---|---|---|
+| [#9](https://github.com/seuros/noiseless/issues/9) | Critical | SQL injection + fail-open geo filter |
+| [#10](https://github.com/seuros/noiseless/issues/10) | Critical | SQL injection via pgvector embeddings |
+| [#11](https://github.com/seuros/noiseless/issues/11) | High | PG/Typesense swallow search errors (completes #1) |
+| [#12](https://github.com/seuros/noiseless/issues/12) | High | `reindex` data loss + discarded `refresh:` |
+| [#13](https://github.com/seuros/noiseless/issues/13) | High | PG adapter wrong results / cross-adapter gaps |
+| [#14](https://github.com/seuros/noiseless/issues/14) | Medium | `paginate`, `IndicesAPI`, callbacks, jobs |
+
+Each issue body contains the defect, a reproduction or the failing SQL, a proposed diff,
+and suggested regression tests.
+
+Two useful pieces of context found while preparing them:
+
+- Upstream PR #1 — *"fix: raise on backend errors instead of returning empty responses"* —
+  converted only Elasticsearch and OpenSearch. `postgresql_execution.rb` is absent from
+  its file list, which is why #11 is framed as completing that PR rather than as a new
+  finding.
+- `bug` labels could not be applied: `AddLabelsToLabelable` needs triage permission,
+  which external contributors do not have. Severity is stated in each issue title and
+  first line instead.
+
+---
+
 ## 2026-10-01 — Code audit and remediation (28 flaws)
 
 A full audit of the 0.7.2 codebase (69 files / 7,692 LOC) followed by fixes and
